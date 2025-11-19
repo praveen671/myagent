@@ -1,0 +1,243 @@
+agent.py
+
+from typing import TypedDict
+from langgraph.graph import StateGraph
+from openai import AzureOpenAI
+from config import AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
+from logging_utils import log_event, log_exception, get_correlation_id
+from typing import List
+
+# Define state schema — match the keys you use in ai_agent_node
+class AgentState(TypedDict):
+    input: str
+    output: str
+    followups: List[str]
+
+
+
+
+# Initialize LangGraph with schema
+graph = StateGraph(AgentState)
+
+# Azure OpenAI client
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version="2024-05-01-preview"
+)
+
+
+def ai_agent_node(state: AgentState):
+    correlation_id = get_correlation_id()
+    log_event("AgentRequest", {"correlation_id": correlation_id, "input": state["input"]})
+    try:
+        # Main answer
+        response = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[{"role": "user", "content": state["input"]}]
+        )
+        output = response.choices[0].message.content
+
+        # Generate follow-up questions
+        followup_prompt = f"Based on this answer: '{output}', suggest 3 relevant follow-up questions."
+        followup_response = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "you person who to response after reviewing,you thinking of  relevant follow-up questions."},
+                {"role": "user", "content": followup_prompt}
+            ],
+            temperature=0.7
+        )
+        followups_text = followup_response.choices[0].message.content
+        followups = [q.strip("- ").strip() for q in followups_text.split("\n") if q.strip()]
+
+        log_event("AgentResponse", {"correlation_id": correlation_id, "output": output, "followups": followups})
+        return {"input": state["input"], "output": output, "followups": followups}
+
+    except Exception as e:
+        log_exception(e)
+
+    
+graph.add_node("ai_agent", ai_agent_node)
+graph.set_entry_point("ai_agent")  # Define starting node
+compiled_graph = graph.compile()   # Compile the workflow
+
+
+api.py
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from agent import compiled_graph
+from logging_utils import log_event, log_exception, get_correlation_id
+from typing import List
+
+app = FastAPI()
+
+class AgentRequest(BaseModel):
+    input: str
+
+class AgentResponse(BaseModel):
+    status: str
+    answer: str
+    followups: List[str]
+    
+
+
+
+@app.post("/agent")
+async def run_agent(request: AgentRequest):
+    correlation_id = get_correlation_id()
+    log_event("APIRequest", {"correlation_id": correlation_id, "input": request.input})
+    try:
+        # Invoke the compiled LangGraph workflow
+        result = compiled_graph.invoke({"input": request.input})
+        output = result.get("output", "No output")
+        followups = result.get("followups", "No followups")
+
+        log_event("APIResponse", {"correlation_id": correlation_id, "output": output})
+        return AgentResponse(status="success", answer=output, followups=followups)
+    except Exception as e:
+        log_exception(e)
+        raise HTTPException(status_code=500, answer=e)
+
+@app.get("/")
+def root():
+    return {"message": "API is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+config.py
+
+import os
+
+# Configuration for Azure OpenAI
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+
+# Application Insights / logging
+APPINSIGHTS_CONNECTION_STRING = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
+APPINSIGHTS_INSTRUMENTATIONKEY = os.getenv("APPINSIGHTS_INSTRUMENTATIONKEY")
+
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+APP_INSIGHTS_CONN_STRING = os.getenv("APP_INSIGHTS_CONN_STRING")
+AGENT_API_URL = os.getenv("AGENT_API_URL", "http://localhost:8000/agent")
+
+logging_utils.py
+
+import logging
+import contextvars
+from typing import Any, Dict, Optional
+
+try:
+    from applicationinsights import TelemetryClient
+except Exception:
+    TelemetryClient = None
+
+from config import APPINSIGHTS_CONNECTION_STRING, APPINSIGHTS_INSTRUMENTATIONKEY
+
+_correlation_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("correlation_id", default=None)
+
+logger = logging.getLogger("sample_agent")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(ch)
+
+
+class _Telemetry:
+    def __init__(self):
+        self._client = None
+        key = APPINSIGHTS_CONNECTION_STRING or APPINSIGHTS_INSTRUMENTATIONKEY
+        if TelemetryClient and key:
+            try:
+                self._client = TelemetryClient(key)
+            except Exception:
+                self._client = None
+
+    def track_event(self, name: str, properties: Optional[Dict[str, Any]] = None):
+        if self._client:
+            self._client.track_event(name, properties or {})
+            self._client.flush()
+
+    def track_exception(self, exc: Exception, properties: Optional[Dict[str, Any]] = None):
+        if self._client:
+            try:
+                self._client.track_exception(exception=exc, properties=properties or {})
+                self._client.flush()
+            except Exception:
+                pass
+
+
+_telemetry = _Telemetry()
+
+
+def set_correlation_id(cid: str):
+    _correlation_id.set(cid)
+
+
+def get_correlation_id() -> Optional[str]:
+    return _correlation_id.get()
+
+
+def log_event(name: str, properties: Optional[Dict[str, Any]] = None):
+    cid = get_correlation_id()
+    props = dict(properties or {})
+    if cid:
+        props.setdefault("correlation_id", cid)
+    logger.info("%s %s", name, props)
+    try:
+        _telemetry.track_event(name, props)
+    except Exception:
+        pass
+
+
+def log_exception(exc: Exception, properties: Optional[Dict[str, Any]] = None):
+    cid = get_correlation_id()
+    props = dict(properties or {})
+    if cid:
+        props.setdefault("correlation_id", cid)
+    logger.exception("Exception: %s - %s", exc, props)
+    try:
+        _telemetry.track_exception(exc, props)
+    except Exception:
+        pass
+from applicationinsights import TelemetryClient
+import uuid
+import os
+
+
+instrumentation_key = os.getenv("APP_INSIGHTS_CONN_STRING")  # This should be just the key
+tc = TelemetryClient(instrumentation_key)
+
+def log_event(name, properties=None):
+    tc.track_event(name, properties)
+    tc.flush()
+
+def log_exception(exception):
+    tc.track_exception(exception)
+    tc.flush()
+
+def get_correlation_id():
+    return str(uuid.uuid4())
+
+
+
+
+
+
+
