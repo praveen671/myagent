@@ -1,0 +1,143 @@
+import streamlit as st
+import requests
+from pydantic import BaseModel
+from typing import List, Dict
+
+# API endpoint
+API_URL = "http://127.0.0.1:8000/agent"
+
+# Pydantic models
+class AgentRequest(BaseModel):
+    input: str
+
+class AgentResponse(BaseModel):
+    status: str
+    answer: str
+    followups: List[str]  # API should return this list
+
+# Configure page
+st.set_page_config(page_title="LLM Chat", layout="wide")
+st.title("🤖 LLM Chatbot")
+
+# Initialize session state
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "current_chat_id" not in st.session_state:
+    st.session_state.current_chat_id = -1
+if "followup_suggestions" not in st.session_state:
+    st.session_state.followup_suggestions = []
+
+DEFAULT_SUGGESTIONS = [
+    "Can you explain that further?",
+    "What are some examples?",
+    "How does this compare to other methods?"
+]
+
+# Functions
+def new_chat():
+    chat_id = len(st.session_state.chat_history)
+    st.session_state.chat_history.append({"id": chat_id, "messages": []})
+    st.session_state.current_chat_id = chat_id
+
+def get_current_messages() -> List[Dict]:
+    if st.session_state.current_chat_id == -1:
+        return []
+    return st.session_state.chat_history[st.session_state.current_chat_id]["messages"]
+
+def set_current_messages(messages: List[Dict]):
+    if st.session_state.current_chat_id == -1:
+        new_chat()
+    st.session_state.chat_history[st.session_state.current_chat_id]["messages"] = messages
+
+def call_api(prompt: str) -> Dict[str, any]:
+    """Call API and return answer + followups."""
+    try:
+        req = AgentRequest(input=prompt)
+        response = requests.post(API_URL, json=req.dict())
+        if response.status_code == 200:
+            res = AgentResponse(**response.json())
+            return {"answer": res.answer, "followups": res.followups}
+        else:
+            st.error(f"API responded with status {response.status_code}")
+            return {"answer": "", "followups": []}
+    except Exception as e:
+        st.error(f"Request failed: {e}")
+        return {"answer": "", "followups": []}
+
+# Sidebar
+with st.sidebar:
+    st.header("Chat Controls")
+    if st.button("➕ New Chat"):
+        new_chat()
+        st.rerun()
+    st.markdown("---")
+    st.markdown("### Chat History")
+    for chat in st.session_state.chat_history:
+        chat_id = chat["id"]
+        messages = chat["messages"]
+        last_msg = messages[-1]["content"] if messages else "Empty"
+        if st.button(f"Chat {chat_id+1}: {last_msg[:25]}...", key=f"load_{chat_id}"):
+            st.session_state.current_chat_id = chat_id
+            st.session_state.followup_suggestions = []
+            st.rerun()
+
+# Ensure at least one chat exists
+if st.session_state.current_chat_id == -1:
+    new_chat()
+
+messages = get_current_messages()
+
+# Display messages
+for msg in messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Follow-up suggestions
+if messages and messages[-1]["role"] == "assistant":
+    st.markdown("---")
+    st.markdown("### Follow-up questions")
+    suggestions = st.session_state.followup_suggestions or DEFAULT_SUGGESTIONS
+    cols = st.columns(len(suggestions))
+    for i, s in enumerate(suggestions):
+        if cols[i].button(s, key=f"suggestion_{i}"):
+            prompt = s
+            messages.append({"role": "user", "content": prompt})
+            set_current_messages(messages)
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # Call API
+            result = call_api(prompt)
+            answer = result["answer"]
+            followups = result["followups"]
+
+            messages.append({"role": "assistant", "content": answer})
+            set_current_messages(messages)
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+
+            # Update follow-up suggestions dynamically
+            st.session_state.followup_suggestions = followups if followups else []
+            st.rerun()
+
+# Main input
+prompt = st.chat_input("Type your message...")
+if prompt:
+    messages.append({"role": "user", "content": prompt})
+    set_current_messages(messages)
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Call API for response
+    result = call_api(prompt)
+    answer = result["answer"]
+    followups = result["followups"]
+
+    messages.append({"role": "assistant", "content": answer})
+    set_current_messages(messages)
+    with st.chat_message("assistant"):
+        st.markdown(answer)
+
+    # Update follow-up suggestions from API or fallback
+    st.session_state.followup_suggestions = followups if followups else DEFAULT_SUGGESTIONS
+    st.rerun()
