@@ -237,6 +237,272 @@ def get_correlation_id():
 
 
 
+"""
+Simple LangChain Agent Example - All in One File
+This demonstrates a basic agent with tools, following LangChain v1.x best practices.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_openai import AzureChatOpenAI
+import os
+from dotenv import load_dotenv
+
+# ==============================================================================
+# Section 1: Configuration
+# ==============================================================================
+
+# Load environment variables from .env file
+load_dotenv()
+
+AZURE_CONFIG = {
+    "azure_endpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
+    "api_key": os.getenv("AZURE_OPENAI_API_KEY"),
+    "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+    "azure_deployment": os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+    "model": os.getenv("AZURE_OPENAI_MODEL", "gpt-4o-mini"),
+    "temperature": float(os.getenv("AZURE_OPENAI_TEMPERATURE", "0.1")),
+}
+
+
+# ==============================================================================
+# Section 2: Tool Definitions
+# ==============================================================================
+
+@tool
+def calculate_sum(numbers: list[float]) -> float:
+    """Calculate the sum of a list of numbers.
+    
+    Args:
+        numbers: A list of numbers to sum together.
+        
+    Returns:
+        The sum of all numbers in the list.
+    """
+    print("method invocked" )
+    return sum(numbers)
+
+
+@tool
+def get_word_count(text: str) -> int:
+    """Count the number of words in a text string.
+    
+    Args:
+        text: The text to count words in.
+        
+    Returns:
+        The number of words in the text.
+    """
+    return len(text.split())
+
+
+@tool
+def reverse_text(text: str) -> str:
+    """Reverse the characters in a text string.
+    
+    Args:
+        text: The text to reverse.
+        
+    Returns:
+        The reversed text.
+    """
+    return text[::-1]
+
+
+@tool
+def create_json_object(key: str, value: Any) -> str:
+    """Create a JSON object with a single key-value pair.
+    
+    Args:
+        key: The key name for the JSON object.
+        value: The value to store (can be string, number, list, or dict).
+        
+    Returns:
+        A JSON string representation of the object.
+    """
+    return json.dumps({key: value}, indent=2)
+
+
+# ==============================================================================
+# Section 3: Agent Class
+# ==============================================================================
+
+class SimpleAgent:
+    """A simple LangChain agent with tool calling capabilities."""
+    
+    def __init__(self, azure_config: dict[str, Any]) -> None:
+        """Initialize the agent with Azure OpenAI configuration.
+        
+        Args:
+            azure_config: Dictionary containing Azure OpenAI configuration.
+        """
+        self.llm = AzureChatOpenAI(**azure_config)
+        
+        # Register all tools
+        self.tools = [
+            calculate_sum,
+            get_word_count,
+            reverse_text,
+            create_json_object,
+        ]
+        
+        # Create tool map for quick lookup
+        self.tool_map = {tool.name: tool for tool in self.tools}
+        
+        # Bind tools to the LLM
+        self.tool_llm = self.llm.bind_tools(self.tools)
+        
+        # System prompt
+        self.system_prompt = (
+            "You are a helpful AI assistant with access to several tools. "
+            "Use the available tools to help answer user questions accurately. "
+            "Always use tools when they are relevant to the user's request."
+        )
+        
+        # Conversation history
+        self.history: list[HumanMessage | AIMessage] = []
+    
+    def _execute_tool(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Execute a tool by name with the provided arguments.
+        
+        Args:
+            tool_name: Name of the tool to execute.
+            args: Dictionary of arguments to pass to the tool.
+            
+        Returns:
+            The tool's output as a string.
+        """
+        tool = self.tool_map.get(tool_name)
+        if not tool:
+            return f"Error: Tool '{tool_name}' not found."
+        
+        try:
+            result = tool.invoke(args)
+            return str(result)
+        except Exception as e:
+            return f"Error executing tool '{tool_name}': {str(e)}"
+    
+    def chat(self, user_message: str) -> str:
+        """Process a user message and return the agent's response.
+        
+        Args:
+            user_message: The user's input message.
+            
+        Returns:
+            The agent's response after potentially using tools.
+        """
+        # Build conversation
+        conversation: list[SystemMessage | HumanMessage | AIMessage | ToolMessage] = [
+            SystemMessage(content=self.system_prompt)
+        ]
+        conversation.extend(self.history)
+        conversation.append(HumanMessage(content=user_message))
+        
+        # Get initial response from LLM
+        ai_message = self.tool_llm.invoke(conversation)
+        print(f"🤖 LLM wants to use tools: {bool(getattr(ai_message, 'tool_calls', None))}")
+        
+        # Tool calling loop
+        while getattr(ai_message, "tool_calls", None):
+            print(f"🔧 Executing {len(ai_message.tool_calls)} tool call(s)...")
+            
+            tool_messages: list[ToolMessage] = []
+            for call in ai_message.tool_calls:
+                tool_name = call.get("name")
+                tool_args = call.get("args", {})
+                
+                print(f"   → Tool: {tool_name}, Args: {tool_args}")
+                
+                # Execute the tool
+                observation = self._execute_tool(tool_name, tool_args)
+                print(f"   ✓ Result: {observation[:100]}...")
+                
+                # Create tool message
+                tool_messages.append(
+                    ToolMessage(content=observation, tool_call_id=call["id"])
+                )
+            
+            # Add messages to conversation
+            conversation.append(ai_message)
+            conversation.extend(tool_messages)
+            
+            # Get next response from LLM
+            ai_message = self.tool_llm.invoke(conversation)
+        
+        # Save to history
+        self.history.append(HumanMessage(content=user_message))
+        self.history.append(ai_message)
+        
+        # Return final response
+        return ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
+    
+    def clear_history(self) -> None:
+        """Clear the conversation history."""
+        self.history.clear()
+        print("✓ Conversation history cleared.")
+
+
+# ==============================================================================
+# Section 4: Example Usage
+# ==============================================================================
+
+def main() -> None:
+    """Main function demonstrating the agent's capabilities."""
+    
+    print("=" * 70)
+    print("Simple LangChain Agent Demo")
+    print("=" * 70)
+    
+    # Create agent
+    agent = SimpleAgent(AZURE_CONFIG)
+    
+    # Example 1: Math calculation
+    print("\n📝 Example 1: Math Calculation")
+    print("-" * 70)
+    response = agent.chat("What is the sum of 10, 25, 33, and 47?")
+    print(f"Agent: {response}\n")
+    
+    # Example 2: Text processing
+    print("\n📝 Example 2: Text Processing")
+    print("-" * 70)
+    response = agent.chat("How many words are in the sentence: 'LangChain makes building agents easy'?")
+    print(f"Agent: {response}\n")
+    
+    # Example 3: String manipulation
+    print("\n📝 Example 3: String Manipulation")
+    print("-" * 70)
+    response = agent.chat("Reverse the text 'Hello World'")
+    print(f"Agent: {response}\n")
+    
+    # Example 4: JSON creation
+    print("\n📝 Example 4: JSON Creation")
+    print("-" * 70)
+    response = agent.chat("Create a JSON object with key 'status' and value 'success'")
+    print(f"Agent: {response}\n")
+    
+    # Example 5: Multiple tool usage
+    print("\n📝 Example 5: Multiple Tools")
+    print("-" * 70)
+    response = agent.chat(
+        "Calculate the sum of 5, 10, 15 and then tell me how many words are in 'AI agents are powerful tools'"
+    )
+    print(f"Agent: {response}\n")
+    
+    # Clear history
+    agent.clear_history()
+    
+    print("=" * 70)
+    print("Demo completed!")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+
 
 
 
