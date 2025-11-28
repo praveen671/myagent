@@ -1,0 +1,49 @@
+tempcode
+    def invoke(self, user_message: str) -> str:
+        """Process a user message and return the agent's response.
+        
+        Args:
+            user_message: The user's input message.
+            
+        Returns:
+            The agent's response after potentially using tools.
+        """
+        # Build conversation (no history)
+        conversation: list[SystemMessage | HumanMessage | AIMessage | ToolMessage] = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=user_message)
+        ]
+        
+        # Get initial response from LLM
+        ai_message = self.tool_llm.invoke(conversation)
+        print(f"🤖 LLM wants to use tools: {bool(getattr(ai_message, 'tool_calls', None))}")
+        
+        # Tool calling loop
+        while getattr(ai_message, "tool_calls", None):
+            print(f"🔧 Executing {len(ai_message.tool_calls)} tool call(s)...")
+            
+            tool_messages: list[ToolMessage] = []
+            for call in ai_message.tool_calls:
+                tool_name = call.get("name")
+                tool_args = call.get("args", {})
+                
+                print(f"   → Tool: {tool_name}, Args: {tool_args}")
+                
+                # Execute the tool
+                observation = self._execute_tool(tool_name, tool_args)
+                print(f"   ✓ Result: {observation[:100]}...")
+                
+                # Create tool message
+                tool_messages.append(
+                    ToolMessage(content=observation, tool_call_id=call["id"])
+                )
+            
+            # Add messages to conversation
+            conversation.append(ai_message)
+            conversation.extend(tool_messages)
+            
+            # Get next response from LLM
+            ai_message = self.tool_llm.invoke(conversation)
+        
+        # Return final response
+        return ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
